@@ -109,7 +109,6 @@ setup_database() {
   node scripts/seed.mjs
   node scripts/seed-calendar.mjs
   node scripts/ensure-settings.mjs
-  node scripts/sync-document-counters.mjs
   c_ok "Seed concluído"
 }
 

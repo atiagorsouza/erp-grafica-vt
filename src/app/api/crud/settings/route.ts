@@ -1,6 +1,7 @@
+import controlPanelConfig from "../../../../../config/control-panel-settings.json";
 import { db, clearSettingsCache } from "@/lib/crud";
 import { settings } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, asc } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +22,16 @@ async function upsertSetting(data: Record<string, unknown>) {
   }
   const [row] = await db.insert(settings).values({ key, value, category }).returning();
   return row;
+}
+
+export async function GET() {
+  const rows = await db.select().from(settings).orderBy(asc(settings.category), asc(settings.key));
+  return Response.json({
+    ok: true,
+    rows,
+    groups: controlPanelConfig.groups,
+    version: controlPanelConfig.version,
+  });
 }
 
 /**

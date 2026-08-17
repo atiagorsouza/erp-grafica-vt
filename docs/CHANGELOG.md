@@ -5,6 +5,21 @@ Versionamento: [SemVer](https://semver.org/lang/pt-BR/).
 
 ---
 
+## [3.0.1] — 2026-08-17
+
+### Corrigido
+- Painel de Controle agora usa `config/control-panel-settings.json` como fonte canônica única para abas, campos e valores padrão.
+- `scripts/ensure-settings.mjs` passa a ler a mesma fonte canônica da UI, evitando divergência entre servidor local e sandbox após updates.
+- `bash scripts/update.sh` repara automaticamente configurações novas sem sobrescrever valores existentes.
+- `GET /api/crud/settings` agora retorna `rows`, `groups` e `version` para diagnóstico.
+- Corrigidos campos desencontrados de Kanban, Orçamentos e Calendário.
+- Removidas opções de canal de entrada ligadas a comunicação automática (WhatsApp/e-mail) do Painel.
+
+### Operação
+- Após update em servidor já instalado, rode normalmente `bash scripts/update.sh`; ele executa o reparo do painel antes do rebuild.
+
+---
+
 ## [3.0.0] — 2026-08-17
 
 ### Base limpa (breaking)
@@ -35,12 +50,8 @@ Nova linha de versão a partir de uma base reorganizada para produção.
 #### Mantido
 - App Router Next.js + PostgreSQL (Drizzle ORM)
 - Módulos: Dashboard, PDV, Orçamentos, Pedidos, Clientes/CRM, Kanban, Calendário, Impressoras, Produtos, Tabelas de preços, Serviços, Estoque, Financeiro, Relatórios, Configurações
+- Links manuais de WhatsApp Web nos documentos (sem envio automático)
 - Campo de contato WhatsApp em clientes / empresa (cadastro apenas)
-
-#### Corrigido depois do baseline
-- PDV: caixa obrigatório configurável, cálculo de gaveta por parcelas em dinheiro, financeiro com taxa de cartão separada, validação de dinheiro recebido e cupom configurável.
-- Orçamentos: servidor recalcula itens/preços usando banco, update de status não apaga itens, integração Clientes → novo orçamento por querystring, conversão orçamento → pedido idempotente, Kanban e financeiro sincronizados.
-- Instalação/update: `ensure-settings` e `sync-document-counters` garantem novas configurações e evitam colisão de numeração após seed/importação.
 
 ### Migração a partir de 2.x
 
