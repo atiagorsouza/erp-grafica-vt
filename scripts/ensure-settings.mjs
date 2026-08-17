@@ -56,7 +56,7 @@ const SETTINGS = [
   ["quote_validity_days", "7", "orcamentos"],
   ["quote_default_payment", "PIX", "orcamentos"],
   ["quote_default_seller", "OPERADOR", "orcamentos"],
-  ["quote_terms", "Orçamento válido conforme prazo informado. Produção inicia após aprovação e pagamento combinado.", "orcamentos"],
+  ["quote_default_notes", "Orçamento válido conforme prazo informado. Produção inicia após aprovação e pagamento combinado.", "orcamentos"],
 
   // pedidos / OS
   ["order_default_priority", "normal", "pedidos"],

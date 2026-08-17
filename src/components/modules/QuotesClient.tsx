@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { mutate } from "@/lib/mutate";
 import {
   Badge,
@@ -53,6 +53,13 @@ export type PosCompany = {
   pixKey: string;
 };
 
+export type QuoteConfig = {
+  validityDays: number;
+  defaultPayment: string;
+  defaultSeller: string;
+  defaultNotes: string;
+};
+
 type Item = {
   description: string;
   productId?: number | null;
@@ -76,6 +83,7 @@ export function QuotesClient({
   services,
   orders,
   company,
+  quoteConfig,
 }: {
   quotes: Row[];
   items: Row[];
@@ -84,8 +92,11 @@ export function QuotesClient({
   services: Row[];
   orders: Row[];
   company: PosCompany;
+  quoteConfig: QuoteConfig;
 }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const openedFromQuery = useRef(false);
   const [customersList, setCustomersList] = useState<Row[]>(initialCustomers);
 
   const [filter, setFilter] = useState("all");
@@ -141,22 +152,32 @@ export function QuotesClient({
     return { subtotal, disc, shippingFee, taxes, total };
   }, [editItems, form.discount, form.shippingFee, form.taxPct]);
 
-  function openNew() {
+  function openNew(customerId?: string) {
+    const days = Math.max(1, Number(quoteConfig.validityDays || 10));
     setEditId(null);
     setEditItems([{ description: "", quantity: 1, unitPrice: 0, total: 0 }]);
     setForm({
+      customerId: customerId || "",
       status: "rascunho",
-      validUntil: new Date(Date.now() + 10 * 86400000).toISOString().slice(0, 10),
-      paymentMethod: "PIX",
+      validUntil: new Date(Date.now() + days * 86400000).toISOString().slice(0, 10),
+      paymentMethod: quoteConfig.defaultPayment || "PIX",
       channel: "Atendimento",
-      sellerName: "TIAGO SOUZA",
+      sellerName: quoteConfig.defaultSeller || "OPERADOR",
       discount: "0",
       shippingFee: "0",
       taxPct: "0",
-      notes: "Validade da proposta de 10 dias. Pagamento 50% na aprovação e 50% na entrega.",
+      notes: quoteConfig.defaultNotes || "",
     });
     setEditorOpen(true);
   }
+
+  useEffect(() => {
+    if (openedFromQuery.current) return;
+    if (searchParams.get("novo") !== "1") return;
+    openedFromQuery.current = true;
+    openNew(searchParams.get("customerId") || undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   function openEdit(q: Row) {
     setEditId(Number(q.id));
@@ -320,9 +341,9 @@ export function QuotesClient({
         eyebrow="Propostas comerciais & Vendas"
         title="Orçamentos"
         icon="quote"
-        description="Elabore propostas profissionais com produtos do motor de precificação, envie por WhatsApp e converta orçamentos aprovados em Ordens de Produção."
+        description="Elabore propostas profissionais com produtos do motor de precificação e converta orçamentos aprovados em Pedidos / Ordens de Serviço."
         actions={
-          <Button icon="plus" onClick={openNew}>
+          <Button icon="plus" onClick={() => openNew()}>
             Novo orçamento
           </Button>
         }
@@ -376,7 +397,7 @@ export function QuotesClient({
           title="Nenhum orçamento encontrado"
           hint="Crie uma nova proposta comercial em segundos."
           action={
-            <Button icon="plus" onClick={openNew}>
+            <Button icon="plus" onClick={() => openNew()}>
               Criar orçamento
             </Button>
           }
@@ -791,23 +812,6 @@ export function QuotesClient({
               </div>
 
               <div className="flex items-center gap-2">
-                <Button
-                  variant="soft"
-                  icon="whatsapp"
-                  onClick={() => {
-                    const c = custName(view.customerId);
-                    const text = `*${company.name}*\n*PROPOSTA COMERCIAL ${view.number}*\nCliente: ${c ? c.name : "Consumidor final"}\nTotal: ${formatBRL(Number(view.total || 0))}\nValidade: ${view.validUntil || "10 dias"}\n\nCondições: ${view.notes || "A combinar"}`;
-                    const phone = c?.whatsapp || c?.phone || "";
-                    const cleanPhone = phone.replace(/\D/g, "");
-                    const url = cleanPhone
-                      ? `https://wa.me/55${cleanPhone}?text=${encodeURIComponent(text)}`
-                      : `https://wa.me/?text=${encodeURIComponent(text)}`;
-                    window.open(url, "_blank");
-                  }}
-                >
-                  WhatsApp
-                </Button>
-
                 <Button
                   variant="ink"
                   icon="printer"

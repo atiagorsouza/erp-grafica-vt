@@ -105,7 +105,8 @@ migrate_schema() {
 
   c_info "Garantindo configurações novas sem sobrescrever produção..."
   node scripts/ensure-settings.mjs
-  c_ok "Configurações atualizadas"
+  node scripts/sync-document-counters.mjs
+  c_ok "Configurações e contadores atualizados"
 }
 
 rebuild() {

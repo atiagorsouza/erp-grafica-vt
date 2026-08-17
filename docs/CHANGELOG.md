@@ -35,8 +35,12 @@ Nova linha de versão a partir de uma base reorganizada para produção.
 #### Mantido
 - App Router Next.js + PostgreSQL (Drizzle ORM)
 - Módulos: Dashboard, PDV, Orçamentos, Pedidos, Clientes/CRM, Kanban, Calendário, Impressoras, Produtos, Tabelas de preços, Serviços, Estoque, Financeiro, Relatórios, Configurações
-- Links manuais de WhatsApp Web nos documentos (sem envio automático)
 - Campo de contato WhatsApp em clientes / empresa (cadastro apenas)
+
+#### Corrigido depois do baseline
+- PDV: caixa obrigatório configurável, cálculo de gaveta por parcelas em dinheiro, financeiro com taxa de cartão separada, validação de dinheiro recebido e cupom configurável.
+- Orçamentos: servidor recalcula itens/preços usando banco, update de status não apaga itens, integração Clientes → novo orçamento por querystring, conversão orçamento → pedido idempotente, Kanban e financeiro sincronizados.
+- Instalação/update: `ensure-settings` e `sync-document-counters` garantem novas configurações e evitam colisão de numeração após seed/importação.
 
 ### Migração a partir de 2.x
 

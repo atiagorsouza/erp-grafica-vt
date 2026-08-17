@@ -33,6 +33,10 @@ export interface PricingDefaults {
   pdv_require_customer: boolean;
   pdv_require_open_cash: boolean;
   pdv_receipt_footer: string;
+  quote_validity_days: number;
+  quote_default_payment: string;
+  quote_default_seller: string;
+  quote_default_notes: string;
 }
 
 const DEFAULTS: PricingDefaults = {
@@ -65,6 +69,10 @@ const DEFAULTS: PricingDefaults = {
   pdv_require_customer: false,
   pdv_require_open_cash: true,
   pdv_receipt_footer: "Agradecemos a preferência! Volte sempre.",
+  quote_validity_days: 10,
+  quote_default_payment: "PIX",
+  quote_default_seller: "OPERADOR",
+  quote_default_notes: "Validade da proposta conforme prazo informado. Produção inicia após aprovação e pagamento combinado.",
 };
 
 let cache: PricingDefaults | null = null;
@@ -131,6 +139,12 @@ export async function getPricingDefaults(): Promise<PricingDefaults> {
           ? DEFAULTS.pdv_require_open_cash
           : isSettingEnabled(map.get("pdv_require_open_cash")),
       pdv_receipt_footer: map.get("pdv_receipt_footer") || DEFAULTS.pdv_receipt_footer,
+      quote_validity_days: intValue(map.get("quote_validity_days"), DEFAULTS.quote_validity_days, 1, 365),
+      quote_default_payment: map.get("quote_default_payment") || DEFAULTS.quote_default_payment,
+      quote_default_seller:
+        map.get("quote_default_seller") || map.get("pdv_seller_default") || DEFAULTS.quote_default_seller,
+      quote_default_notes:
+        map.get("quote_default_notes") || map.get("quote_terms") || DEFAULTS.quote_default_notes,
     };
     return cache;
   } catch {
@@ -157,4 +171,10 @@ const percentToRate = (v: string | null | undefined, fallback: number): number =
   // se já veio como fração (< 1 e não é zero intencional de config), aceita
   if (n > 0 && n < 1) return n;
   return n / 100;
+};
+
+const intValue = (v: string | null | undefined, fallback: number, min: number, max: number): number => {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
 };

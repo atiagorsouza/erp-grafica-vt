@@ -586,7 +586,9 @@ export const orders = pgTable("orders", {
   notes: text("notes"),
   createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
-});
+}, (table) => [
+  uniqueIndex("orders_quote_id_unique_idx").on(table.quoteId),
+]);
 
 export const artApprovals = pgTable("art_approvals", {
   id: serial("id").primaryKey(),

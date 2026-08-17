@@ -47,6 +47,12 @@ export default async function OrcamentosPage() {
         website: defaults.company_website,
         pixKey: defaults.pix_key,
       }}
+      quoteConfig={{
+        validityDays: defaults.quote_validity_days,
+        defaultPayment: defaults.quote_default_payment,
+        defaultSeller: defaults.quote_default_seller,
+        defaultNotes: defaults.quote_default_notes,
+      }}
     />
   );
 }
