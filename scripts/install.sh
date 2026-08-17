@@ -108,6 +108,7 @@ setup_database() {
   c_info "Populando dados iniciais (seed)..."
   node scripts/seed.mjs
   node scripts/seed-calendar.mjs
+  node scripts/ensure-settings.mjs
   c_ok "Seed concluído"
 }
 

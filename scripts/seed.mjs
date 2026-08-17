@@ -59,12 +59,23 @@ async function main() {
 
     ["card_fee_debit", "1.99"],
     ["card_fee_credit", "4.99"],
+    ["pdv_seller_default", "OPERADOR"],
+    ["pdv_delivery_default", "Retirada no balcão"],
+    ["pdv_allow_negative_stock", "false"],
+    ["pdv_require_customer", "false"],
+    ["pdv_require_open_cash", "true"],
+    ["pdv_receipt_footer", "Agradecemos a preferência! Volte sempre."],
   ];
   for (const [k, v] of settings) {
-    const category = k.startsWith("document_") ? "documentos"
-      : k.startsWith("fiscal_") ? "fiscal"
-      : (k.includes("rate") || k.includes("fee") || k.includes("rounding")) ? "tributacao"
-      : "geral";
+    const category = k.startsWith("document_")
+      ? "documentos"
+      : k.startsWith("fiscal_")
+        ? "fiscal"
+        : k.startsWith("pdv_")
+          ? "pdv"
+          : (k.includes("rate") || k.includes("fee") || k.includes("rounding"))
+            ? "tributacao"
+            : "geral";
     await q(`INSERT INTO settings (key, value, category) VALUES ($1,$2,$3)`, [k, v, category]);
   }
 

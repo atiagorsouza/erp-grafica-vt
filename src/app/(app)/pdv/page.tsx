@@ -26,18 +26,20 @@ export default async function PdvPage() {
 
   return (
     <PosClient
-      products={productRows.map((p) => ({
-        id: p.id,
-        name: p.name,
-        sku: p.sku,
-        barcode: p.barcode ?? null,
-        finalPrice: p.finalPrice,
-        productCategoryId: p.productCategoryId,
-        active: p.active,
-        trackStock: p.trackStock,
-        stock: p.stock,
-        minStock: p.minStock,
-      }))}
+      products={productRows
+        .filter((p) => p.active !== false)
+        .map((p) => ({
+          id: p.id,
+          name: p.name,
+          sku: p.sku,
+          barcode: p.barcode ?? null,
+          finalPrice: p.finalPrice,
+          productCategoryId: p.productCategoryId,
+          active: p.active,
+          trackStock: p.trackStock,
+          stock: p.stock,
+          minStock: p.minStock,
+        }))}
       productCats={productCats.map((c) => ({
         id: c.id,
         name: c.name,
@@ -77,9 +79,18 @@ export default async function PdvPage() {
         cep: defaults.company_cep,
         website: defaults.company_website,
         pixKey: defaults.pix_key,
+        receiptFooter: defaults.pdv_receipt_footer,
       }}
       cardFeeDebit={defaults.cardFeeRate}
       cardFeeCredit={defaults.cardFeeCreditRate}
+      pdvConfig={{
+        sellerDefault: defaults.pdv_seller_default,
+        deliveryDefault: defaults.pdv_delivery_default,
+        allowNegativeStock: defaults.pdv_allow_negative_stock,
+        requireCustomer: defaults.pdv_require_customer,
+        requireOpenCash: defaults.pdv_require_open_cash,
+        receiptFooter: defaults.pdv_receipt_footer,
+      }}
       cashSession={
         session
           ? {

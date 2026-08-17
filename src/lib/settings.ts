@@ -1,13 +1,12 @@
 import "server-only";
 import { db } from "@/db";
 import { settings } from "@/db/schema";
-import { eq } from "drizzle-orm";
 
 export interface PricingDefaults {
-  taxRate: number; // imposto sobre venda (%)
-  operationalRate: number; // custo operacional global para markup divisor (%)
-  cardFeeRate: number; // taxa maquininha débito (%)
-  cardFeeCreditRate: number; // taxa maquininha crédito (%)
+  taxRate: number; // imposto sobre venda (fração 0-1)
+  operationalRate: number; // custo operacional global para markup divisor (fração)
+  cardFeeRate: number; // taxa maquininha débito (fração)
+  cardFeeCreditRate: number; // taxa maquininha crédito (fração)
   company_name: string;
   company_legal_name: string;
   company_trade_name: string;
@@ -27,6 +26,13 @@ export interface PricingDefaults {
   pix_key: string;
   fiscal_environment: string;
   fiscal_tax_regime: string;
+  /* PDV */
+  pdv_seller_default: string;
+  pdv_delivery_default: string;
+  pdv_allow_negative_stock: boolean;
+  pdv_require_customer: boolean;
+  pdv_require_open_cash: boolean;
+  pdv_receipt_footer: string;
 }
 
 const DEFAULTS: PricingDefaults = {
@@ -53,13 +59,19 @@ const DEFAULTS: PricingDefaults = {
   pix_key: "contato.vt@vtdigital.com.br",
   fiscal_environment: "homologacao",
   fiscal_tax_regime: "simples",
+  pdv_seller_default: "OPERADOR",
+  pdv_delivery_default: "Retirada no balcão",
+  pdv_allow_negative_stock: false,
+  pdv_require_customer: false,
+  pdv_require_open_cash: true,
+  pdv_receipt_footer: "Agradecemos a preferência! Volte sempre.",
 };
 
 let cache: PricingDefaults | null = null;
 
 /**
  * Lê configurações do Painel de Controle com fallback para defaults.
- * Cache em memória por processo (revalidate clears em server actions).
+ * Cache em memória por processo (invalidado via clearSettingsCache).
  */
 export async function getPricingDefaults(): Promise<PricingDefaults> {
   if (cache) return cache;
@@ -82,13 +94,15 @@ export async function getPricingDefaults(): Promise<PricingDefaults> {
       district,
       [city, state].filter(Boolean).join(" / "),
       cep && `CEP ${cep}`,
-    ].filter(Boolean).join(" — ");
+    ]
+      .filter(Boolean)
+      .join(" — ");
 
     cache = {
-      taxRate: num(map.get("tax_rate"), DEFAULTS.taxRate),
-      operationalRate: num(map.get("operational_rate"), DEFAULTS.operationalRate),
-      cardFeeRate: num(map.get("card_fee_debit"), DEFAULTS.cardFeeRate),
-      cardFeeCreditRate: num(map.get("card_fee_credit"), DEFAULTS.cardFeeCreditRate),
+      taxRate: percentToRate(map.get("tax_rate"), DEFAULTS.taxRate),
+      operationalRate: percentToRate(map.get("operational_rate"), DEFAULTS.operationalRate),
+      cardFeeRate: percentToRate(map.get("card_fee_debit"), DEFAULTS.cardFeeRate),
+      cardFeeCreditRate: percentToRate(map.get("card_fee_credit"), DEFAULTS.cardFeeCreditRate),
       company_name: tradeName,
       company_legal_name: legalName,
       company_trade_name: tradeName,
@@ -108,10 +122,19 @@ export async function getPricingDefaults(): Promise<PricingDefaults> {
       pix_key: map.get("pix_key") || DEFAULTS.pix_key,
       fiscal_environment: map.get("fiscal_environment") || DEFAULTS.fiscal_environment,
       fiscal_tax_regime: map.get("fiscal_tax_regime") || DEFAULTS.fiscal_tax_regime,
+      pdv_seller_default: map.get("pdv_seller_default") || DEFAULTS.pdv_seller_default,
+      pdv_delivery_default: map.get("pdv_delivery_default") || DEFAULTS.pdv_delivery_default,
+      pdv_allow_negative_stock: isSettingEnabled(map.get("pdv_allow_negative_stock")),
+      pdv_require_customer: isSettingEnabled(map.get("pdv_require_customer")),
+      pdv_require_open_cash:
+        map.get("pdv_require_open_cash") == null
+          ? DEFAULTS.pdv_require_open_cash
+          : isSettingEnabled(map.get("pdv_require_open_cash")),
+      pdv_receipt_footer: map.get("pdv_receipt_footer") || DEFAULTS.pdv_receipt_footer,
     };
     return cache;
   } catch {
-    return DEFAULTS;
+    return { ...DEFAULTS };
   }
 }
 
@@ -119,16 +142,19 @@ export function clearSettingsCache() {
   cache = null;
 }
 
-/**
- * Utilitário helper para verificar se uma chave de configuração está ativa.
- */
+/** Utilitário helper para verificar se uma chave de configuração está ativa. */
 export function isSettingEnabled(value: string | null | undefined): boolean {
-  if (!value) return false;
+  if (value == null) return false;
   const lower = String(value).toLowerCase().trim();
   return lower === "true" || lower === "1" || lower === "sim" || lower === "yes" || lower === "ativo";
 }
 
-const num = (v: string | null | undefined, fallback: number): number => {
-  const n = v ? parseFloat(v) : NaN;
-  return Number.isFinite(n) ? n / 100 : fallback; // valores guardados em %
+/** Converte valor salvo em % ("6", "1.99") para fração (0.06, 0.0199). */
+const percentToRate = (v: string | null | undefined, fallback: number): number => {
+  if (v == null || String(v).trim() === "") return fallback;
+  const n = parseFloat(String(v).replace(",", "."));
+  if (!Number.isFinite(n)) return fallback;
+  // se já veio como fração (< 1 e não é zero intencional de config), aceita
+  if (n > 0 && n < 1) return n;
+  return n / 100;
 };

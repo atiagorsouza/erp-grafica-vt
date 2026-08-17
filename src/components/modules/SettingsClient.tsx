@@ -101,7 +101,8 @@ const GROUPS: Group[] = [
       { key: "pdv_delivery_default",     label: "Situação de entrega padrão", type: "select", options: [{ value: "Entrega direto para o cliente", label: "Entrega direto para o cliente" }, { value: "Retirada no balcão", label: "Retirada no balcão" }, { value: "Envio por Motoboy / Transportadora", label: "Envio por Motoboy / Transportadora" }] },
       { key: "pdv_allow_negative_stock", label: "Permitir venda com estoque negativo?", type: "select", options: [{ value: "false", label: "Não (exige confirmação)" }, { value: "true", label: "Sim (sem bloqueio)" }] },
       { key: "pdv_require_customer",     label: "Exigir cliente identificado?", type: "select", options: [{ value: "false", label: "Não (consumidor final)" }, { value: "true", label: "Sim (obrigatório)" }] },
-      { key: "pdv_receipt_footer",       label: "Rodapé do cupom térmico", type: "textarea", span2: true, hint: "Aparece no final do cupom impresso e WhatsApp" },
+      { key: "pdv_require_open_cash",    label: "Exigir caixa aberto para vender?", type: "select", options: [{ value: "true", label: "Sim (recomendado em produção)" }, { value: "false", label: "Não (permite vender sem sessão)" }] },
+      { key: "pdv_receipt_footer",       label: "Rodapé do cupom térmico", type: "textarea", span2: true, hint: "Aparece no final do cupom impresso e no texto do WhatsApp" },
     ],
   },
 

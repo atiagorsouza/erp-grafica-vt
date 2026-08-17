@@ -12,7 +12,6 @@ import {
   Modal,
   Segmented,
   Select,
-  Textarea,
   toast,
 } from "@/components/ui";
 import { Icon } from "@/components/icons";
@@ -22,7 +21,6 @@ import {
   cardFeeAmount,
   formatBRL,
   round2,
-  toDecimalString,
   toNumber,
   toPositive,
 } from "@/lib/money";
@@ -85,6 +83,16 @@ export type PosCompany = {
   cep: string;
   website: string;
   pixKey: string;
+  receiptFooter?: string;
+};
+
+export type PdvConfig = {
+  sellerDefault: string;
+  deliveryDefault: string;
+  allowNegativeStock: boolean;
+  requireCustomer: boolean;
+  requireOpenCash: boolean;
+  receiptFooter: string;
 };
 
 export type CashSession = {
@@ -150,6 +158,7 @@ export function PosClient({
   company,
   cardFeeDebit,
   cardFeeCredit,
+  pdvConfig,
   cashSession: initialSession,
 }: {
   products: PosProduct[];
@@ -158,6 +167,7 @@ export function PosClient({
   company: PosCompany;
   cardFeeDebit: number;
   cardFeeCredit: number;
+  pdvConfig: PdvConfig;
   cashSession: CashSession;
 }) {
   const router = useRouter();
@@ -172,10 +182,12 @@ export function PosClient({
   const [discountMode, setDiscountMode] = useState<"value" | "percent">("value");
   const [payment, setPayment] = useState("PIX");
   const [receivedInput, setReceivedInput] = useState("");
-  const [sellerName, setSellerName] = useState("TIAGO SOUZA");
-  const [deliveryMode, setDeliveryMode] = useState("Entrega direto para o cliente");
+  const [sellerName, setSellerName] = useState(pdvConfig.sellerDefault || "OPERADOR");
+  const [deliveryMode, setDeliveryMode] = useState(
+    pdvConfig.deliveryDefault || "Retirada no balcão"
+  );
   const [deliveryDate, setDeliveryDate] = useState("");
-  const [notes, setNotes] = useState("Não deixe de aproveitar as nossas promoções!!!");
+  const [notes, setNotes] = useState(pdvConfig.receiptFooter || "");
   const [showExtraFields, setShowExtraFields] = useState(false);
 
   const [charging, setCharging] = useState(false);
@@ -188,14 +200,22 @@ export function PosClient({
 
   const searchRef = useRef<HTMLInputElement>(null);
   const clientRef = useRef<string>(uid());
+  const chargingLock = useRef(false);
 
-  /* Carrega vendedor do localStorage para conveniência */
+  /* Preferência local de vendedor sobrescreve o padrão do painel */
   useEffect(() => {
     try {
       const saved = localStorage.getItem("pdv_seller_name");
       if (saved) setSellerName(saved);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
   }, []);
+
+  /* Sincroniza sessão quando o servidor revalida */
+  useEffect(() => {
+    setSession(initialSession);
+  }, [initialSession]);
 
   const handleSellerChange = (name: string) => {
     setSellerName(name);
@@ -328,14 +348,30 @@ export function PosClient({
 
   /* ---------------- FINALIZAR VENDA (SEM REFRESH BLOQUEANTE) ---------------- */
   async function checkout(allowNegativeStock = false) {
+    if (chargingLock.current || charging) return;
     if (cart.length === 0) return toast.error("Carrinho vazio");
+    if (pdvConfig.requireOpenCash && !session) {
+      toast.error("Caixa fechado", "Abra o caixa antes de vender.");
+      setCashOpen(true);
+      return;
+    }
+    if (pdvConfig.requireCustomer && !customerId) {
+      return toast.error("Cliente obrigatório", "Identifique o cliente antes de finalizar.");
+    }
+    if (isCash && received <= 0) {
+      return toast.error("Informe o valor recebido em dinheiro");
+    }
     if (missingCash) return toast.error("Valor recebido menor que o total");
+
+    chargingLock.current = true;
     setCharging(true);
 
     const now = new Date();
     const dateFormatted = now.toLocaleDateString("pt-BR");
     const timeFormatted = now.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
     const finalDeliveryDate = deliveryDate.trim() || `${dateFormatted} Hora: ${timeFormatted}`;
+    const cartSnapshot = [...cart];
+    const totalsSnapshot = { subtotal, discount, fee, total, payment, received, change };
 
     try {
       const res = await fetch("/api/crud/sales", {
@@ -344,19 +380,23 @@ export function PosClient({
         body: JSON.stringify({
           clientRef: clientRef.current,
           customerId: customerId ? Number(customerId) : null,
-          type: "produto",
-          items: cart.map((l) => ({
+          type: cartSnapshot.every((l) => !l.productId)
+            ? "servico"
+            : cartSnapshot.some((l) => !l.productId)
+              ? "mixto"
+              : "produto",
+          items: cartSnapshot.map((l) => ({
             productId: l.productId,
             description: l.description,
             quantity: l.quantity,
             unitPrice: l.unitPrice,
           })),
-          discount: discount,
+          discount: totalsSnapshot.discount,
           discountMode: "value",
           paymentMethod: payment,
           receivedAmount: isCash && received > 0 ? received : undefined,
           cashSessionId: session?.id ?? null,
-          allowNegativeStock,
+          allowNegativeStock: allowNegativeStock || pdvConfig.allowNegativeStock,
           sellerName,
           deliveryMode,
           deliveryDate: finalDeliveryDate,
@@ -365,6 +405,11 @@ export function PosClient({
       });
       const json = await res.json();
 
+      if (res.status === 409 && json.details?.code === "CASH_CLOSED") {
+        toast.error("Caixa fechado", json.error);
+        setCashOpen(true);
+        return;
+      }
       if (res.status === 409 && json.details?.shortages) {
         setConfirmOversell(json.error);
         return;
@@ -373,15 +418,14 @@ export function PosClient({
 
       const row = json.row;
 
-      /* Prepara os dados do cupom perfeito */
       const newReceipt: ReceiptData = {
         number: String(row.number),
         soldAt: row.createdAt ? new Date(row.createdAt) : now,
-        items: [...cart],
-        subtotal,
-        discount,
-        fee,
-        total: toNumber(row.total, total),
+        items: cartSnapshot,
+        subtotal: totalsSnapshot.subtotal,
+        discount: totalsSnapshot.discount,
+        fee: toNumber(row.cardFee, totalsSnapshot.fee),
+        total: toNumber(row.total, totalsSnapshot.total),
         payment,
         received: isCash && received > 0 ? received : null,
         change: isCash && received > 0 ? change : null,
@@ -399,10 +443,10 @@ export function PosClient({
       );
       setConfirmOversell(null);
       clearCart();
-      /* ATENÇÃO: NÃO chamamos router.refresh() aqui! O refresh ocorre suavemente ao fechar o cupom */
     } catch (e) {
       toast.error("Falha na venda", e instanceof Error ? e.message : undefined);
     } finally {
+      chargingLock.current = false;
       setCharging(false);
     }
   }
@@ -431,6 +475,23 @@ export function PosClient({
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_minmax(350px,410px)]">
         {/* ─────────── Catálogo ─────────── */}
         <div className="no-print">
+          {pdvConfig.requireOpenCash && !session && (
+            <div className="reveal mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3">
+              <div className="flex items-start gap-2 text-[12.5px] text-amber-900">
+                <Icon name="alert" size={16} className="mt-0.5 shrink-0" />
+                <div>
+                  <p className="font-semibold">Caixa fechado</p>
+                  <p className="text-amber-800">
+                    Abra o caixa para liberar vendas e manter o fechamento de gaveta correto.
+                  </p>
+                </div>
+              </div>
+              <Button size="sm" icon="wallet" onClick={() => setCashOpen(true)}>
+                Abrir caixa
+              </Button>
+            </div>
+          )}
+
           <div className="reveal mb-4 flex flex-wrap items-center gap-2.5">
             <div className="relative w-full max-w-sm">
               <Icon
@@ -872,13 +933,24 @@ export function PosClient({
               </div>
 
               {/* BOTÃO FINALIZAR */}
+              {pdvConfig.requireCustomer && !customerId && cart.length > 0 && (
+                <p className="mt-2 rounded-md bg-amber-500/10 px-2 py-1.5 text-center font-mono text-[10px] text-amber-200">
+                  Cliente obrigatório para finalizar
+                </p>
+              )}
               <Button
                 size="lg"
                 className="mt-3.5 w-full font-bold"
                 icon="circle-check"
                 loading={charging}
                 onClick={() => checkout()}
-                disabled={cart.length === 0 || missingCash}
+                disabled={
+                  cart.length === 0 ||
+                  missingCash ||
+                  (pdvConfig.requireOpenCash && !session) ||
+                  (pdvConfig.requireCustomer && !customerId) ||
+                  (isCash && received <= 0)
+                }
               >
                 Finalizar Venda · {formatBRL(total)}
               </Button>
@@ -944,6 +1016,7 @@ export function PosClient({
         open={cashOpen}
         onClose={() => setCashOpen(false)}
         session={session}
+        operatorDefault={sellerName}
         onChanged={(s) => {
           setSession(s);
           router.refresh();
@@ -1183,16 +1256,12 @@ function ThermalReceipt({
 
       {/* ── 7. RODAPÉ E INFORMAÇÕES ADICIONAIS ── */}
       <div className="text-left space-y-1 text-[11px]">
-        <p className="leading-snug">
-          Agradecemos pela preferência, esperamos seu retorno em breve!
+        <p className="font-bold uppercase">
+          Vendedor: {receipt.sellerName || "OPERADOR"}
         </p>
 
         <p className="font-bold uppercase">
-          Vendedor: {receipt.sellerName || "TIAGO SOUZA"}
-        </p>
-
-        <p className="font-bold uppercase">
-          Situacao: {receipt.deliveryMode || "Entrega direto para o cliente"}
+          Situacao: {receipt.deliveryMode || "Retirada no balcão"}
         </p>
 
         <p className="font-bold uppercase">
@@ -1203,16 +1272,36 @@ function ThermalReceipt({
           {receipt.payment === "PIX"
             ? "PIX"
             : receipt.payment === "Dinheiro"
-              ? "AVISTA"
+              ? "DINHEIRO / AVISTA"
               : receipt.payment.toUpperCase()}
         </p>
 
-        <p className="mt-2 pt-1 border-t border-dotted border-black font-semibold text-[10.5px]">
-          Informações / Anotações / Observações Geral
-        </p>
+        {receipt.fee > 0 && (
+          <p className="font-mono text-[10px]">
+            Taxa cartão embutida: R$ {formatNum(receipt.fee)}
+          </p>
+        )}
 
-        <p className="leading-snug">
-          {receipt.notes || "Não deixe de aproveitar as nossas promoções!!!"}
+        {(receipt.notes || company.receiptFooter) && (
+          <>
+            <p className="mt-2 border-t border-dotted border-black pt-1 font-semibold text-[10.5px]">
+              Observações
+            </p>
+            <p className="leading-snug">
+              {receipt.notes || company.receiptFooter}
+            </p>
+          </>
+        )}
+
+        {company.pixKey && receipt.payment === "PIX" && (
+          <p className="mt-1 font-mono text-[10px]">PIX: {company.pixKey}</p>
+        )}
+
+        <p className="mt-2 text-center text-[10px] leading-snug">
+          {company.receiptFooter || "Agradecemos a preferência!"}
+        </p>
+        <p className="text-center text-[9px] uppercase tracking-wider">
+          Documento não fiscal · {receipt.number}
         </p>
       </div>
     </div>
@@ -1236,35 +1325,51 @@ function buildTextReceipt(r: ReceiptData, comp: PosCompany): string {
   const dateFormatted = d.toLocaleDateString("pt-BR");
   const timeFormatted = d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
-  let text = `*${comp.name || "VTDIGITAL ART STUDIO"}*\n`;
-  text += `${comp.address}\n`;
-  text += `Tel: ${comp.phone} / ${comp.phone2}\n`;
-  text += `--------------------------------\n`;
-  text += `CUPOM NAO FISCAL ${r.number} ${timeFormatted} ${dateFormatted}\n`;
-  text += `--------------------------------\n`;
+  const lines = [
+    `*${comp.name || "PrintFlow"}*`,
+    comp.address,
+    `Tel: ${[comp.phone, comp.phone2].filter(Boolean).join(" / ")}`,
+    "--------------------------------",
+    `CUPOM NÃO FISCAL ${r.number}`,
+    `${dateFormatted} ${timeFormatted}`,
+    "--------------------------------",
+  ];
 
   if (r.customer) {
-    text += `CLIENTE: ${r.customer.name}\n`;
-    if (r.customer.document) text += `DOC: ${r.customer.document}\n`;
-    if (r.customer.phone) text += `TEL: ${r.customer.phone}\n`;
-    text += `--------------------------------\n`;
+    lines.push(`CLIENTE: ${r.customer.name}`);
+    if (r.customer.document) lines.push(`DOC: ${r.customer.document}`);
+    if (r.customer.phone || r.customer.whatsapp) {
+      lines.push(`TEL: ${r.customer.whatsapp || r.customer.phone}`);
+    }
+    lines.push("--------------------------------");
   }
 
-  text += `ITENS:\n`;
-  r.items.forEach((l) => {
-    text += `- ${l.description}\n  ${l.quantity}x R$ ${formatNum(l.unitPrice)} = R$ ${formatNum(l.unitPrice * l.quantity)}\n`;
-  });
+  lines.push("ITENS:");
+  for (const l of r.items) {
+    lines.push(`• ${l.description}`);
+    lines.push(
+      `  ${formatQty(l.quantity)} x R$ ${formatNum(l.unitPrice)} = R$ ${formatNum(l.unitPrice * l.quantity)}`
+    );
+  }
 
-  text += `--------------------------------\n`;
-  text += `PRODUTOS: R$ ${formatNum(r.subtotal)}\n`;
-  if (r.discount > 0) text += `DESCONTO: R$ ${formatNum(r.discount)}\n`;
-  text += `*TOTAL: R$ ${formatNum(r.total)}*\n`;
-  text += `FORMA DE PAGTO: ${r.payment}\n`;
-  text += `--------------------------------\n`;
-  text += `Vendedor: ${r.sellerName}\n`;
-  text += `Situacao: ${r.deliveryMode}\n`;
-  text += `${r.notes}\n`;
-  return text;
+  lines.push("--------------------------------");
+  lines.push(`PRODUTOS: R$ ${formatNum(r.subtotal)}`);
+  if (r.discount > 0) lines.push(`DESCONTO: R$ ${formatNum(r.discount)}`);
+  if (r.fee > 0) lines.push(`TAXA CARTÃO: R$ ${formatNum(r.fee)}`);
+  lines.push(`*TOTAL: R$ ${formatNum(r.total)}*`);
+  lines.push(`PAGAMENTO: ${r.payment}`);
+  if (r.received != null) lines.push(`RECEBIDO: R$ ${formatNum(r.received)}`);
+  if (r.change != null && r.change > 0) lines.push(`TROCO: R$ ${formatNum(r.change)}`);
+  if (r.payment === "PIX" && comp.pixKey) lines.push(`CHAVE PIX: ${comp.pixKey}`);
+  lines.push("--------------------------------");
+  lines.push(`Vendedor: ${r.sellerName || "OPERADOR"}`);
+  lines.push(`Situação: ${r.deliveryMode || "Retirada no balcão"}`);
+  if (r.deliveryDate) lines.push(`Entrega: ${r.deliveryDate}`);
+  if (r.notes) lines.push(r.notes);
+  if (comp.receiptFooter) lines.push(comp.receiptFooter);
+  lines.push(`Documento não fiscal · ${r.number}`);
+
+  return lines.filter(Boolean).join("\n");
 }
 
 /* ==================================================================
@@ -1590,18 +1695,27 @@ function CashModal({
   open,
   onClose,
   session,
+  operatorDefault,
   onChanged,
 }: {
   open: boolean;
   onClose: () => void;
   session: CashSession;
+  operatorDefault?: string;
   onChanged: (s: CashSession) => void;
 }) {
   const [amount, setAmount] = useState("");
+  const [operator, setOperator] = useState(operatorDefault || "");
   const [reason, setReason] = useState("");
   const [moveKind, setMoveKind] = useState<"sangria" | "suprimento">("sangria");
   const [counted, setCounted] = useState("");
   const [busy, setBusy] = useState(false);
+  const [summary, setSummary] = useState<{
+    expected: number;
+    salesCount: number;
+    salesTotal: number;
+    movements: { id: number; kind: string; amount: string | number; reason: string | null }[];
+  } | null>(null);
   const [result, setResult] = useState<{
     expected: number;
     counted: number;
@@ -1609,13 +1723,35 @@ function CashModal({
   } | null>(null);
 
   useEffect(() => {
-    if (open) {
-      setAmount("");
-      setReason("");
-      setCounted("");
-      setResult(null);
+    if (!open) return;
+    setAmount("");
+    setReason("");
+    setCounted("");
+    setResult(null);
+    setOperator(operatorDefault || "");
+    if (session) {
+      void loadSummary();
+    } else {
+      setSummary(null);
     }
-  }, [open]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, session?.id]);
+
+  async function loadSummary() {
+    try {
+      const res = await fetch("/api/pdv/cash-session");
+      const json = await res.json();
+      if (!res.ok) return;
+      setSummary({
+        expected: toNumber(json.expected, 0),
+        salesCount: Number(json.salesCount || 0),
+        salesTotal: toNumber(json.salesTotal, 0),
+        movements: Array.isArray(json.movements) ? json.movements : [],
+      });
+    } catch {
+      /* ignore */
+    }
+  }
 
   async function call(payload: Record<string, unknown>) {
     setBusy(true);
@@ -1645,14 +1781,23 @@ function CashModal({
     >
       {!session ? (
         <div className="space-y-3">
-          <p className="text-[12px] text-ink-500">Informe o fundo de troco inicial da gaveta.</p>
+          <p className="text-[12px] text-ink-500">
+            Informe o operador e o fundo de troco inicial da gaveta.
+          </p>
+          <Field label="Operador">
+            <Input
+              value={operator}
+              onChange={(e) => setOperator(e.target.value)}
+              placeholder="Nome do operador"
+              autoFocus
+            />
+          </Field>
           <Field label="Valor de abertura (R$)">
             <Input
               mono
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               placeholder="0,00"
-              autoFocus
             />
           </Field>
           <Button
@@ -1660,10 +1805,19 @@ function CashModal({
             icon="wallet"
             loading={busy}
             onClick={async () => {
-              const json = await call({ op: "open", openingAmount: toPositive(amount) });
-              if (json) {
+              const json = await call({
+                op: "open",
+                openingAmount: toPositive(amount),
+                operator: operator.trim() || operatorDefault || null,
+              });
+              if (json?.session) {
                 toast.success("Caixa aberto");
-                onChanged(json.session);
+                onChanged({
+                  id: json.session.id,
+                  operator: json.session.operator,
+                  openingAmount: json.session.openingAmount,
+                  openedAt: json.session.openedAt,
+                });
                 onClose();
               }
             }}
@@ -1676,7 +1830,7 @@ function CashModal({
           <p className="text-[13px] font-semibold text-ink-900">Caixa fechado</p>
           <div className="rounded-lg border border-paper-200 bg-paper-50 p-3 font-mono text-[12px]">
             <p className="flex justify-between">
-              <span className="text-ink-500">Esperado</span>
+              <span className="text-ink-500">Esperado em gaveta</span>
               <span>{formatBRL(result.expected)}</span>
             </p>
             <p className="flex justify-between">
@@ -1693,20 +1847,61 @@ function CashModal({
                     : "text-amber-600"
               )}
             >
-              <span>Diferença</span>
+              <span>{result.difference < 0 ? "Falta" : result.difference > 0 ? "Sobra" : "Diferença"}</span>
               <span>{formatBRL(result.difference)}</span>
             </p>
           </div>
           <Button variant="outline" className="w-full" onClick={onClose}>
-            Fechar
+            Concluir
           </Button>
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="rounded-lg bg-paper-100 px-3 py-2 font-mono text-[11.5px] text-ink-600">
-            Aberto em {new Date(session.openedAt).toLocaleString("pt-BR")} · fundo{" "}
-            {formatBRL(toNumber(session.openingAmount, 0))}
+          <div className="rounded-lg bg-paper-100 px-3 py-2 text-[11.5px] text-ink-600">
+            <p className="font-mono">
+              Aberto em {new Date(session.openedAt).toLocaleString("pt-BR")}
+            </p>
+            <p className="mt-0.5">
+              Operador: <strong>{session.operator || "—"}</strong> · Fundo{" "}
+              <strong className="font-mono tnum">{formatBRL(toNumber(session.openingAmount, 0))}</strong>
+            </p>
+            {summary && (
+              <div className="mt-2 grid grid-cols-3 gap-2 border-t border-paper-200 pt-2 font-mono text-[11px] tnum">
+                <div>
+                  <p className="text-[9px] tracking-wider text-ink-400 uppercase">Vendas</p>
+                  <p className="font-semibold text-ink-800">{summary.salesCount}</p>
+                </div>
+                <div>
+                  <p className="text-[9px] tracking-wider text-ink-400 uppercase">Faturado</p>
+                  <p className="font-semibold text-ink-800">{formatBRL(summary.salesTotal)}</p>
+                </div>
+                <div>
+                  <p className="text-[9px] tracking-wider text-ink-400 uppercase">Gaveta*</p>
+                  <p className="font-semibold text-ink-800">{formatBRL(summary.expected)}</p>
+                </div>
+              </div>
+            )}
+            <p className="mt-1 text-[10px] text-ink-400">
+              *Esperado = abertura + dinheiro + suprimentos − sangrias (fechamento cego esconde até o fim).
+            </p>
           </div>
+
+          {summary && summary.movements.length > 0 && (
+            <div className="max-h-28 space-y-1 overflow-y-auto rounded-lg border border-paper-200 p-2">
+              {summary.movements.map((m) => (
+                <div key={m.id} className="flex justify-between font-mono text-[11px] tnum">
+                  <span className="text-ink-500">
+                    {m.kind}
+                    {m.reason ? ` · ${m.reason}` : ""}
+                  </span>
+                  <span className={m.kind === "sangria" ? "text-red-600" : "text-emerald-600"}>
+                    {m.kind === "sangria" ? "−" : "+"}
+                    {formatBRL(m.amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="space-y-2">
             <Segmented
@@ -1736,16 +1931,19 @@ function CashModal({
               className="w-full"
               loading={busy}
               onClick={async () => {
+                const value = toPositive(amount);
+                if (value <= 0) return toast.error("Informe um valor maior que zero");
                 const json = await call({
                   op: "move",
                   kind: moveKind,
-                  amount: toPositive(amount),
+                  amount: value,
                   reason,
                 });
                 if (json) {
                   toast.success(`${moveKind === "sangria" ? "Sangria" : "Suprimento"} registrado`);
                   setAmount("");
                   setReason("");
+                  await loadSummary();
                 }
               }}
             >
@@ -1756,13 +1954,13 @@ function CashModal({
           <div className="space-y-2 border-t border-paper-200 pt-3">
             <p className="text-[12px] font-semibold text-ink-800">Fechamento cego</p>
             <p className="text-[11.5px] text-ink-500">
-              Conte a gaveta e informe o valor <strong>antes</strong> de ver o esperado.
+              Conte a gaveta e informe o valor. O sistema só revela o esperado depois da contagem.
             </p>
             <Input
               mono
               value={counted}
               onChange={(e) => setCounted(e.target.value)}
-              placeholder="Valor contado"
+              placeholder="Valor contado na gaveta"
             />
             <Button
               variant="ink"
@@ -1770,12 +1968,15 @@ function CashModal({
               className="w-full"
               loading={busy}
               onClick={async () => {
+                if (counted.trim() === "") {
+                  return toast.error("Informe o valor contado");
+                }
                 const json = await call({ op: "close", countedAmount: toPositive(counted) });
                 if (json) {
                   setResult({
-                    expected: json.expected,
-                    counted: json.counted,
-                    difference: json.difference,
+                    expected: toNumber(json.expected, 0),
+                    counted: toNumber(json.counted, 0),
+                    difference: toNumber(json.difference, 0),
                   });
                   onChanged(null);
                 }

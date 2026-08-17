@@ -35,8 +35,9 @@ bash scripts/start.sh
    - `pg_dump` se o binário existir
 4. `npm ci` / `npm install`
 5. `drizzle-kit push`
-6. `rm -rf .next && npm run build`
-7. Atualiza `.printflow/install.json`
+6. `node scripts/ensure-settings.mjs` (cria chaves novas sem sobrescrever valores existentes)
+7. `rm -rf .next && npm run build`
+8. Atualiza `.printflow/install.json`
 
 ## Rollback rápido
 

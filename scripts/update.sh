@@ -102,6 +102,10 @@ migrate_schema() {
   c_info "Aplicando mudanças de schema (drizzle-kit push)..."
   npx drizzle-kit push
   c_ok "Schema sincronizado"
+
+  c_info "Garantindo configurações novas sem sobrescrever produção..."
+  node scripts/ensure-settings.mjs
+  c_ok "Configurações atualizadas"
 }
 
 rebuild() {

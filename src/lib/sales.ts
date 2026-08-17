@@ -11,13 +11,12 @@ import {
   transactions,
   cashSessions,
 } from "@/db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { nextDocumentNumber } from "@/lib/documents";
 import { getPricingDefaults } from "@/lib/settings";
 import {
   applyDiscount,
   cardFeeAmount,
-  grossUp,
   round2,
   toDecimalString,
   toNumber,
@@ -26,9 +25,6 @@ import {
 
 /* ==================================================================
  *  VALIDAÇÃO (Zod)
- *
- *  `z.coerce.number().finite()` é o que barra o bug do NaN: o cliente
- *  mandava "NaN" como string e o numeric do PostgreSQL aceitava.
  * ================================================================== */
 
 const finiteNumber = z.coerce.number().finite();
@@ -52,14 +48,11 @@ export const saleInputSchema = z.object({
   items: z.array(saleItemSchema).min(1, "Carrinho vazio"),
   discount: finiteNumber.min(0).default(0),
   discountMode: z.enum(["value", "percent"]).default("value"),
-  /** método único (legado) ou lista de pagamentos (split) */
   paymentMethod: z.string().trim().max(40).nullable().optional(),
   payments: z.array(paymentSchema).optional(),
   receivedAmount: finiteNumber.min(0).optional(),
   cashSessionId: z.coerce.number().int().positive().nullable().optional(),
-  /** venda a descoberto exige confirmação explícita do operador */
   allowNegativeStock: z.boolean().default(false),
-  /** dados do cupom e impressão */
   sellerName: z.string().trim().max(100).optional(),
   deliveryMode: z.string().trim().max(100).optional(),
   deliveryDate: z.string().trim().max(50).optional(),
@@ -67,17 +60,27 @@ export const saleInputSchema = z.object({
 });
 
 export type SaleInput = z.infer<typeof saleInputSchema>;
-
 export type SaleError = { error: string; status: number; details?: unknown };
 
 const CARD_METHODS = new Set(["Débito", "Crédito"]);
+const KNOWN_METHODS = new Set(["PIX", "Dinheiro", "Débito", "Crédito"]);
+
+type ProductRow = typeof products.$inferSelect;
+
+type ResolvedLine = {
+  productId: number | null;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  total: number;
+  product?: ProductRow;
+};
 
 /* ==================================================================
  *  CRIAÇÃO DE VENDA
  * ================================================================== */
 
 export async function createSale(raw: unknown) {
-  /* ---------- 1. validação de forma ---------- */
   const parsed = saleInputSchema.safeParse(raw);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
@@ -88,38 +91,36 @@ export async function createSale(raw: unknown) {
     } satisfies SaleError;
   }
   const input = parsed.data;
+  const defaults = await getPricingDefaults();
+
+  /* ---------- 1. políticas do PDV ---------- */
+  if (defaults.pdv_require_customer && !input.customerId) {
+    return {
+      error: "Identifique o cliente antes de finalizar a venda",
+      status: 422,
+    } satisfies SaleError;
+  }
 
   /* ---------- 2. idempotência ---------- */
   if (input.clientRef) {
-    const [existing] = await db
-      .select()
-      .from(sales)
-      .where(eq(sales.clientRef, input.clientRef));
+    const [existing] = await db.select().from(sales).where(eq(sales.clientRef, input.clientRef));
     if (existing) return { ok: true as const, row: existing, duplicated: true };
   }
 
-  /* ---------- 3. preço vem do BANCO, não do cliente ----------
-   * O cliente enviava subtotal/total já calculados; era possível
-   * forjar `total: "0.01"` num produto de R$ 500.               */
-  const productIds = [...new Set(input.items.map((i) => i.productId).filter((id): id is number => !!id))];
-  /* busca individual: o carrinho tem poucos itens e evita a quirk do
-   * driver com `= ANY($1)` gerado pelo inArray nesta versão do Drizzle. */
-  const productMap = new Map<number, typeof products.$inferSelect>();
-  for (const id of productIds) {
-    const [row] = await db.select().from(products).where(eq(products.id, id));
-    if (row) productMap.set(row.id, row);
+  /* ---------- 3. preço vem do BANCO ---------- */
+  const productIds = [
+    ...new Set(input.items.map((i) => i.productId).filter((id): id is number => !!id)),
+  ];
+  const productMap = new Map<number, ProductRow>();
+  if (productIds.length > 0) {
+    const rows = await db.select().from(products).where(inArray(products.id, productIds));
+    for (const row of rows) productMap.set(row.id, row);
   }
 
-  type ResolvedLine = {
-    productId: number | null;
-    description: string;
-    quantity: number;
-    unitPrice: number;
-    total: number;
-    product?: typeof products.$inferSelect;
-  };
-
   const validLines: ResolvedLine[] = [];
+  let hasProduct = false;
+  let hasServiceLike = false;
+
   for (const item of input.items) {
     const product = item.productId ? productMap.get(item.productId) : undefined;
     if (item.productId && !product) {
@@ -128,12 +129,22 @@ export async function createSale(raw: unknown) {
     if (product && product.active === false) {
       return { error: `Produto "${product.name}" está inativo`, status: 422 } satisfies SaleError;
     }
-    // produto cadastrado → preço do banco; item avulso → preço digitado
+
     const unitPrice = product ? toNumber(product.finalPrice, 0) : toPositive(item.unitPrice);
     if (product && unitPrice <= 0) {
-      return { error: `Produto "${product.name}" está sem preço final definido`, status: 422 } satisfies SaleError;
+      return {
+        error: `Produto "${product.name}" está sem preço final definido`,
+        status: 422,
+      } satisfies SaleError;
     }
+    if (!product && unitPrice <= 0) {
+      return { error: `Item "${item.description}" sem preço`, status: 422 } satisfies SaleError;
+    }
+
     const quantity = toPositive(item.quantity);
+    if (product) hasProduct = true;
+    else hasServiceLike = true;
+
     validLines.push({
       productId: item.productId ?? null,
       description: product ? String(product.name) : item.description,
@@ -144,51 +155,98 @@ export async function createSale(raw: unknown) {
     });
   }
 
-  /* ---------- 4. totais recalculados no servidor ---------- */
-  const defaults = await getPricingDefaults();
+  const saleType =
+    hasProduct && hasServiceLike ? "mixto" : hasServiceLike ? "servico" : input.type || "produto";
+
+  /* ---------- 4. totais no servidor ---------- */
   const subtotal = round2(validLines.reduce((sum, l) => sum + l.total, 0));
   const discount = applyDiscount(subtotal, input.discount, input.discountMode);
   const net = round2(subtotal - discount);
 
-  const methods = input.payments?.length
-    ? input.payments.map((p) => p.method)
-    : [input.paymentMethod || "PIX"];
-  /* taxa de maquininha só incide sobre a parcela paga em cartão */
-  const cardBase = input.payments?.length
-    ? round2(input.payments.filter((p) => CARD_METHODS.has(p.method)).reduce((s, p) => s + toPositive(p.amount), 0))
-    : CARD_METHODS.has(methods[0])
-      ? net
-      : 0;
-  const feeRate = methods.includes("Crédito")
-    ? defaults.cardFeeCreditRate
-    : methods.includes("Débito")
-      ? defaults.cardFeeRate
-      : 0;
+  const payments =
+    input.payments && input.payments.length > 0
+      ? input.payments
+          .map((p) => ({ method: p.method.trim(), amount: round2(toPositive(p.amount)) }))
+          .filter((p) => p.method && p.amount > 0)
+      : [
+          {
+            method: (input.paymentMethod || "PIX").trim() || "PIX",
+            amount: net, // taxa de cartão é adicionada depois
+          },
+        ];
 
-  /* gross-up: total / (1 - taxa). O antigo usava base * (1 + taxa) e
-   * o líquido ficava abaixo do preço de tabela. */
-  const fee = cardBase > 0 ? cardFeeAmount(cardBase, feeRate) : 0;
+  if (payments.length === 0) {
+    return { error: "Informe ao menos uma forma de pagamento", status: 422 } satisfies SaleError;
+  }
+
+  for (const p of payments) {
+    if (!KNOWN_METHODS.has(p.method)) {
+      return { error: `Forma de pagamento inválida: ${p.method}`, status: 422 } satisfies SaleError;
+    }
+  }
+
+  const methods = payments.map((p) => p.method);
+
+  /* taxa de maquininha só sobre a parcela em cartão, com gross-up */
+  let fee = 0;
+  const pricedPayments = payments.map((p) => {
+    if (!CARD_METHODS.has(p.method)) return { ...p };
+    const rate = p.method === "Crédito" ? defaults.cardFeeCreditRate : defaults.cardFeeRate;
+    const lineFee = rate > 0 ? cardFeeAmount(p.amount, rate) : 0;
+    fee = round2(fee + lineFee);
+    return { method: p.method, amount: round2(p.amount + lineFee) };
+  });
+
+  /* se pagamento único sem split explícito, base da taxa é o líquido */
+  if (!input.payments?.length && CARD_METHODS.has(methods[0])) {
+    const rate = methods[0] === "Crédito" ? defaults.cardFeeCreditRate : defaults.cardFeeRate;
+    fee = rate > 0 ? cardFeeAmount(net, rate) : 0;
+    pricedPayments[0] = { method: methods[0], amount: round2(net + fee) };
+  } else if (input.payments?.length) {
+    const paySum = round2(payments.reduce((s, p) => s + p.amount, 0));
+    if (Math.abs(paySum - net) > 0.05) {
+      return {
+        error: `Soma dos pagamentos (${paySum.toFixed(2)}) difere do líquido (${net.toFixed(2)})`,
+        status: 422,
+      } satisfies SaleError;
+    }
+  }
+
   const total = round2(net + fee);
 
-  /* imposto POR DENTRO — o finalPrice do motor de preços já embute o
-   * imposto, então aqui apenas registramos a parcela embutida para o
-   * fiscal/relatório. NÃO é somado ao total (evita cobrar duas vezes). */
+  /* imposto por dentro — apenas registro, não soma no total */
   const taxRate = toNumber(defaults.taxRate, 0);
   const taxes = taxRate > 0 && taxRate < 1 ? round2(net - net / (1 + taxRate)) : 0;
 
   /* ---------- 5. troco ---------- */
   const isCash = methods.includes("Dinheiro");
+  const cashPortion = pricedPayments
+    .filter((p) => p.method === "Dinheiro")
+    .reduce((s, p) => s + p.amount, 0);
+  /* Dinheiro exige valor recebido explícito do operador (para troco). */
   const received = input.receivedAmount !== undefined ? toPositive(input.receivedAmount) : null;
-  if (isCash && received !== null && received > 0 && received < total) {
-    return { error: `Valor recebido (${received.toFixed(2)}) é menor que o total (${total.toFixed(2)})`, status: 422 } satisfies SaleError;
-  }
-  const change = isCash && received !== null && received > 0 ? round2(received - total) : null;
 
-  /* ---------- 6. conferência de estoque ANTES de gravar ---------- */
+  if (isCash) {
+    if (received == null || received <= 0) {
+      return { error: "Informe o valor recebido em dinheiro", status: 422 } satisfies SaleError;
+    }
+    if (received + 0.001 < cashPortion) {
+      return {
+        error: `Valor recebido (${received.toFixed(2)}) é menor que a parcela em dinheiro (${cashPortion.toFixed(2)})`,
+        status: 422,
+      } satisfies SaleError;
+    }
+  }
+  const change = isCash && received != null ? round2(Math.max(0, received - cashPortion)) : null;
+
+  /* ---------- 6. estoque ---------- */
+  const allowOversell = input.allowNegativeStock || defaults.pdv_allow_negative_stock;
   const shortages = await checkStock(validLines);
-  if (shortages.length > 0 && !input.allowNegativeStock) {
+  if (shortages.length > 0 && !allowOversell) {
     return {
-      error: `Estoque insuficiente: ${shortages.map((s) => `${s.name} (tem ${s.available}, precisa de ${s.required})`).join("; ")}`,
+      error: `Estoque insuficiente: ${shortages
+        .map((s) => `${s.name} (tem ${s.available}, precisa de ${s.required})`)
+        .join("; ")}`,
       status: 409,
       details: { shortages },
     } satisfies SaleError;
@@ -196,16 +254,35 @@ export async function createSale(raw: unknown) {
 
   /* ---------- 7. sessão de caixa ---------- */
   let cashSessionId = input.cashSessionId ?? null;
-  if (!cashSessionId) {
-    const [open] = await db.select().from(cashSessions).where(eq(cashSessions.status, "aberto")).limit(1);
+  if (cashSessionId) {
+    const [session] = await db
+      .select()
+      .from(cashSessions)
+      .where(and(eq(cashSessions.id, cashSessionId), eq(cashSessions.status, "aberto")))
+      .limit(1);
+    if (!session) {
+      return { error: "Sessão de caixa inválida ou já fechada", status: 409 } satisfies SaleError;
+    }
+  } else {
+    const [open] = await db
+      .select()
+      .from(cashSessions)
+      .where(eq(cashSessions.status, "aberto"))
+      .limit(1);
     cashSessionId = open?.id ?? null;
   }
 
+  if (defaults.pdv_require_open_cash && !cashSessionId) {
+    return {
+      error: "Abra o caixa antes de registrar vendas",
+      status: 409,
+      details: { code: "CASH_CLOSED" },
+    } satisfies SaleError;
+  }
+
+  /* ---------- 8. gravação atômica ---------- */
   const number = await nextDocumentNumber("sale");
 
-  /* ---------- 8. tudo ou nada ----------
-   * Antes: venda, baixa de estoque e movimentos rodavam soltos; uma
-   * falha no meio deixava estoque baixado sem venda (ou o inverso). */
   try {
     const row = await db.transaction(async (tx) => {
       const [sale] = await tx
@@ -214,7 +291,7 @@ export async function createSale(raw: unknown) {
           number,
           clientRef: input.clientRef ?? null,
           customerId: input.customerId ?? null,
-          type: input.type,
+          type: saleType,
           items: validLines.map(({ productId, description, quantity, unitPrice, total: lineTotal }) => ({
             productId,
             description,
@@ -228,11 +305,11 @@ export async function createSale(raw: unknown) {
           cardFee: toDecimalString(fee),
           total: toDecimalString(total),
           paymentMethod: methods.join(" + "),
-          payments: input.payments?.length ? input.payments : [{ method: methods[0], amount: total }],
-          receivedAmount: received !== null ? toDecimalString(received, 2) : null,
-          changeAmount: change !== null ? toDecimalString(change, 2) : null,
-          sellerName: input.sellerName ?? null,
-          deliveryMode: input.deliveryMode ?? null,
+          payments: pricedPayments,
+          receivedAmount: received != null ? toDecimalString(received, 2) : null,
+          changeAmount: change != null ? toDecimalString(change, 2) : null,
+          sellerName: (input.sellerName || defaults.pdv_seller_default || null) as string | null,
+          deliveryMode: (input.deliveryMode || defaults.pdv_delivery_default || null) as string | null,
           deliveryDate: input.deliveryDate ?? null,
           notes: input.notes ?? null,
           cashSessionId,
@@ -242,17 +319,18 @@ export async function createSale(raw: unknown) {
 
       await applyStockExit(tx, validLines, number);
 
-      /* lançamento financeiro — antes o PDV não alimentava o caixa */
-      const onCredit = methods.includes("Crédito");
+      const onCredit = methods.includes("Crédito") && methods.every((m) => m === "Crédito");
       const today = new Date().toISOString().slice(0, 10);
       const settleDate = onCredit
         ? new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10)
         : today;
+
+      /* receita líquida da loja (sem taxa de adquirente) */
       await tx.insert(transactions).values({
         type: "receita",
         category: "venda",
-        description: `Venda ${number}${input.customerId ? "" : " · consumidor não identificado"}`,
-        amount: toDecimalString(total, 2),
+        description: `Venda ${number}${input.customerId ? "" : " · consumidor final"}`,
+        amount: toDecimalString(net, 2),
         dueDate: settleDate,
         paidDate: onCredit ? null : today,
         status: onCredit ? "pendente" : "pago",
@@ -260,13 +338,31 @@ export async function createSale(raw: unknown) {
         customerId: input.customerId ?? null,
       });
 
+      /* taxa de cartão como despesa operacional (se houver) */
+      if (fee > 0) {
+        await tx.insert(transactions).values({
+          type: "despesa",
+          category: "taxa_cartao",
+          description: `Taxa de cartão · venda ${number}`,
+          amount: toDecimalString(fee, 2),
+          dueDate: today,
+          paidDate: today,
+          status: "pago",
+          method: methods.filter((m) => CARD_METHODS.has(m)).join(" + ") || "Cartão",
+          customerId: input.customerId ?? null,
+        });
+      }
+
       return sale;
     });
 
-    return { ok: true as const, row, warnings: shortages.length ? { shortages } : undefined };
+    return {
+      ok: true as const,
+      row,
+      warnings: shortages.length ? { shortages } : undefined,
+    };
   } catch (e) {
-    /* clientRef duplicado por corrida: devolve a venda já gravada */
-    if (input.clientRef && String(e).includes("client_ref")) {
+    if (input.clientRef && String(e).toLowerCase().includes("client_ref")) {
       const [existing] = await db.select().from(sales).where(eq(sales.clientRef, input.clientRef));
       if (existing) return { ok: true as const, row: existing, duplicated: true };
     }
@@ -278,12 +374,25 @@ export async function createSale(raw: unknown) {
  *  ESTOQUE
  * ================================================================== */
 
-type Line = { productId: number | null; quantity: number; product?: typeof products.$inferSelect };
+type Line = { productId: number | null; quantity: number; product?: ProductRow };
 
-/** Soma tudo que a venda consome e compara com o disponível. */
 async function checkStock(lines: Line[]) {
   const needProduct = new Map<number, number>();
   const needMaterial = new Map<number, number>();
+  const productIds = lines.map((l) => l.product?.id).filter((id): id is number => !!id);
+
+  const extrasByProduct = new Map<number, { materialId: number | null; quantity: string | null }[]>();
+  if (productIds.length > 0) {
+    const extras = await db
+      .select()
+      .from(productMaterials)
+      .where(inArray(productMaterials.productId, productIds));
+    for (const extra of extras) {
+      const list = extrasByProduct.get(extra.productId) || [];
+      list.push(extra);
+      extrasByProduct.set(extra.productId, list);
+    }
+  }
 
   for (const line of lines) {
     const product = line.product;
@@ -293,10 +402,14 @@ async function checkStock(lines: Line[]) {
     }
     if (product.baseMaterialId) {
       const used = toNumber(product.baseMaterialQty, 0) * line.quantity;
-      if (used > 0) needMaterial.set(product.baseMaterialId, (needMaterial.get(product.baseMaterialId) || 0) + used);
+      if (used > 0) {
+        needMaterial.set(
+          product.baseMaterialId,
+          (needMaterial.get(product.baseMaterialId) || 0) + used
+        );
+      }
     }
-    const extras = await db.select().from(productMaterials).where(eq(productMaterials.productId, product.id));
-    for (const extra of extras) {
+    for (const extra of extrasByProduct.get(product.id) || []) {
       const used = toNumber(extra.quantity, 0) * line.quantity;
       if (used > 0 && extra.materialId) {
         needMaterial.set(extra.materialId, (needMaterial.get(extra.materialId) || 0) + used);
@@ -309,15 +422,23 @@ async function checkStock(lines: Line[]) {
   for (const [id, required] of needProduct) {
     const [row] = await db.select().from(products).where(eq(products.id, id));
     const available = toNumber(row?.stock, 0);
-    if (available < required) {
-      shortages.push({ name: String(row?.name || `Produto ${id}`), available, required: round2(required) });
+    if (available + 1e-9 < required) {
+      shortages.push({
+        name: String(row?.name || `Produto ${id}`),
+        available: round2(available),
+        required: round2(required),
+      });
     }
   }
   for (const [id, required] of needMaterial) {
     const [row] = await db.select().from(materials).where(eq(materials.id, id));
     const available = toNumber(row?.stock, 0);
-    if (available < required) {
-      shortages.push({ name: String(row?.name || `Material ${id}`), available, required: round2(required) });
+    if (available + 1e-9 < required) {
+      shortages.push({
+        name: String(row?.name || `Material ${id}`),
+        available: round2(available),
+        required: round2(required),
+      });
     }
   }
   return shortages;
@@ -331,32 +452,59 @@ async function applyStockExit(tx: Tx, lines: Line[], reference: string) {
     if (!product || line.quantity <= 0) continue;
 
     if (product.trackStock) {
-      await tx.update(products).set({ stock: sql`${products.stock} - ${line.quantity}` }).where(eq(products.id, product.id));
+      await tx
+        .update(products)
+        .set({ stock: sql`${products.stock} - ${line.quantity}` })
+        .where(eq(products.id, product.id));
       await tx.insert(stockMovements).values({
-        kind: "saida", targetType: "product", productId: product.id,
-        quantity: String(line.quantity), reason: "venda", reference, automatic: true,
+        kind: "saida",
+        targetType: "product",
+        productId: product.id,
+        quantity: String(line.quantity),
+        reason: "venda",
+        reference,
+        automatic: true,
       });
     }
 
     if (product.baseMaterialId) {
       const used = toNumber(product.baseMaterialQty, 0) * line.quantity;
       if (used > 0) {
-        await tx.update(materials).set({ stock: sql`${materials.stock} - ${used}` }).where(eq(materials.id, product.baseMaterialId));
+        await tx
+          .update(materials)
+          .set({ stock: sql`${materials.stock} - ${used}` })
+          .where(eq(materials.id, product.baseMaterialId));
         await tx.insert(stockMovements).values({
-          kind: "saida", targetType: "material", materialId: product.baseMaterialId,
-          quantity: String(used), reason: "venda", reference, automatic: true,
+          kind: "saida",
+          targetType: "material",
+          materialId: product.baseMaterialId,
+          quantity: String(used),
+          reason: "venda",
+          reference,
+          automatic: true,
         });
       }
     }
 
-    const extras = await tx.select().from(productMaterials).where(eq(productMaterials.productId, product.id));
+    const extras = await tx
+      .select()
+      .from(productMaterials)
+      .where(eq(productMaterials.productId, product.id));
     for (const extra of extras) {
       const used = toNumber(extra.quantity, 0) * line.quantity;
       if (used <= 0 || !extra.materialId) continue;
-      await tx.update(materials).set({ stock: sql`${materials.stock} - ${used}` }).where(eq(materials.id, extra.materialId));
+      await tx
+        .update(materials)
+        .set({ stock: sql`${materials.stock} - ${used}` })
+        .where(eq(materials.id, extra.materialId));
       await tx.insert(stockMovements).values({
-        kind: "saida", targetType: "material", materialId: extra.materialId,
-        quantity: String(used), reason: "venda", reference, automatic: true,
+        kind: "saida",
+        targetType: "material",
+        materialId: extra.materialId,
+        quantity: String(used),
+        reason: "venda",
+        reference,
+        automatic: true,
       });
     }
   }
@@ -367,12 +515,18 @@ async function applyStockExit(tx: Tx, lines: Line[], reference: string) {
  * ================================================================== */
 
 export async function cancelSale(saleId: number, reason: string) {
+  const cleanReason = reason.trim();
+  if (cleanReason.length < 3) {
+    return { error: "Informe o motivo do cancelamento", status: 400 } satisfies SaleError;
+  }
+
   const [sale] = await db.select().from(sales).where(eq(sales.id, saleId));
   if (!sale) return { error: "Venda não encontrada", status: 404 } satisfies SaleError;
-  if (sale.status === "cancelada") return { error: "Venda já está cancelada", status: 409 } satisfies SaleError;
+  if (sale.status === "cancelada") {
+    return { error: "Venda já está cancelada", status: 409 } satisfies SaleError;
+  }
 
   await db.transaction(async (tx) => {
-    /* devolve ao estoque tudo que a venda tirou */
     const movements = await tx
       .select()
       .from(stockMovements)
@@ -382,32 +536,64 @@ export async function cancelSale(saleId: number, reason: string) {
       const qty = toNumber(mv.quantity, 0);
       if (qty <= 0) continue;
       if (mv.targetType === "product" && mv.productId) {
-        await tx.update(products).set({ stock: sql`${products.stock} + ${qty}` }).where(eq(products.id, mv.productId));
+        await tx
+          .update(products)
+          .set({ stock: sql`${products.stock} + ${qty}` })
+          .where(eq(products.id, mv.productId));
       } else if (mv.targetType === "material" && mv.materialId) {
-        await tx.update(materials).set({ stock: sql`${materials.stock} + ${qty}` }).where(eq(materials.id, mv.materialId));
+        await tx
+          .update(materials)
+          .set({ stock: sql`${materials.stock} + ${qty}` })
+          .where(eq(materials.id, mv.materialId));
       }
       await tx.insert(stockMovements).values({
-        kind: "entrada", targetType: mv.targetType, productId: mv.productId, materialId: mv.materialId,
-        quantity: String(qty), reason: "devolucao", reference: sale.number,
-        notes: `Estorno do cancelamento: ${reason}`, automatic: true,
+        kind: "entrada",
+        targetType: mv.targetType,
+        productId: mv.productId,
+        materialId: mv.materialId,
+        quantity: String(qty),
+        reason: "devolucao",
+        reference: sale.number,
+        notes: `Estorno do cancelamento: ${cleanReason}`,
+        automatic: true,
       });
     }
 
-    /* estorna o financeiro com um lançamento de contrapartida */
+    const netRevenue = round2(toNumber(sale.total, 0) - toNumber(sale.cardFee, 0));
+    const fee = toNumber(sale.cardFee, 0);
+    const today = new Date().toISOString().slice(0, 10);
+
+    /* estorna a receita (despesa de estorno) */
     await tx.insert(transactions).values({
       type: "despesa",
       category: "estorno",
-      description: `Cancelamento da venda ${sale.number} — ${reason}`,
-      amount: toDecimalString(sale.total, 2),
-      paidDate: new Date().toISOString().slice(0, 10),
+      description: `Cancelamento da venda ${sale.number} — ${cleanReason}`,
+      amount: toDecimalString(netRevenue, 2),
+      dueDate: today,
+      paidDate: today,
       status: "pago",
       method: sale.paymentMethod,
       customerId: sale.customerId,
     });
 
+    /* se havia taxa de cartão lançada, estorna como receita (devolução da despesa) */
+    if (fee > 0) {
+      await tx.insert(transactions).values({
+        type: "receita",
+        category: "estorno_taxa",
+        description: `Estorno taxa cartão · venda ${sale.number}`,
+        amount: toDecimalString(fee, 2),
+        dueDate: today,
+        paidDate: today,
+        status: "pago",
+        method: sale.paymentMethod,
+        customerId: sale.customerId,
+      });
+    }
+
     await tx
       .update(sales)
-      .set({ status: "cancelada", canceledAt: new Date(), cancelReason: reason })
+      .set({ status: "cancelada", canceledAt: new Date(), cancelReason: cleanReason })
       .where(eq(sales.id, saleId));
   });
 

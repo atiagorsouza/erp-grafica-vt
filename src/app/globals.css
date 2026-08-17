@@ -2,9 +2,9 @@
 
 @theme {
   /* ── Tipografia ──────────────────────────────────────────────── */
-  --font-display: var(--font-archivo), "Archivo", ui-sans-serif, sans-serif;
-  --font-sans: var(--font-plex-sans), "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-plex-mono), "IBM Plex Mono", ui-monospace, monospace;
+  --font-display: "Archivo", "Segoe UI", "Helvetica Neue", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
 
   /* ── Tinta (superfícies escuras) ─────────────────────────────── */
   --color-ink-950: #0a0e16;
